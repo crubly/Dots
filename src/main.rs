@@ -27,7 +27,7 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 620.0])
             .with_title("Dots")
-            .with_decorations(false),
+            .with_decorations(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -278,63 +278,7 @@ impl DotsApp {
         }
     }
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new("DOTS")
-                    .strong()
-                    .size(18.0)
-                    .color(Color32::WHITE),
-            );
-            ui.label(RichText::new("REMOTE WORKSPACE").size(9.0).color(MUTED));
-            ui.add_space(22.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("SERVERS").size(10.0).color(MUTED));
-                if ui.small_button("+").clicked() {
-                    self.editing = Host::default();
-                    self.selected = None;
-                    self.show_settings = true;
-                }
-            });
-            ui.add_space(6.0);
-            for host in self.hosts.hosts.clone() {
-                let selected = self.selected == Some(host.id);
-                if ui
-                    .selectable_label(selected, format!("●  {}", host.name))
-                    .clicked()
-                {
-                    self.select_host(host.id);
-                    self.show_settings = true;
-                }
-            }
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.separator();
-                ui.label(
-                    RichText::new(if self.active.is_some() {
-                        "● Connected"
-                    } else {
-                        "○ Offline"
-                    })
-                    .color(if self.active.is_some() {
-                        Color32::from_rgb(105, 190, 118)
-                    } else {
-                        MUTED
-                    }),
-                );
-            });
-        });
-    }
-
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let drag_region = ui.interact(
-            ui.max_rect(),
-            ui.id().with("window_drag_region"),
-            egui::Sense::drag(),
-        );
-        if drag_region.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("DOTS")
@@ -383,32 +327,37 @@ impl DotsApp {
     }
 
     fn home_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("HOME").size(10.0).color(MUTED));
-        ui.add_space(18.0);
-        ui.heading(if self.active.is_some() {
-            "Connected workspace"
-        } else {
-            "Connect a server"
-        });
-        ui.label(
-            RichText::new(format!("{}@{}", self.editing.user, self.editing.address)).color(MUTED),
-        );
-        ui.add_space(18.0);
-        if self.active.is_some() {
-            if ui.button("Disconnect").clicked() {
-                self.disconnect();
+        ui.vertical_centered(|ui| {
+            ui.add_space(72.0);
+            if ui
+                .add_sized(
+                    [240.0, 132.0],
+                    egui::Button::new(RichText::new("+").size(36.0).color(ACCENT)).fill(PANEL),
+                )
+                .clicked()
+            {
+                self.editing = Host::default();
+                self.selected = None;
+                self.show_settings = true;
             }
-        } else if ui
-            .add(egui::Button::new(RichText::new("Connect").color(Color32::WHITE)).fill(ACCENT))
-            .clicked()
-        {
-            self.connect();
-        }
-        ui.add_space(24.0);
-        ui.label(RichText::new("RECENT OUTPUT").size(10.0).color(MUTED));
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for line in self.terminal.iter().rev().take(8).rev() {
-                ui.label(RichText::new(line).family(egui::FontFamily::Monospace));
+        });
+        ui.add_space(42.0);
+        ui.horizontal_wrapped(|ui| {
+            for host in self.hosts.hosts.clone() {
+                let card = format!(
+                    "{}\n{}@{}:{}",
+                    host.name, host.user, host.address, host.port
+                );
+                if ui
+                    .add_sized(
+                        [240.0, 132.0],
+                        egui::Button::new(RichText::new(card).size(16.0)).fill(PANEL),
+                    )
+                    .clicked()
+                {
+                    self.select_host(host.id);
+                    self.connect();
+                }
             }
         });
     }
@@ -531,11 +480,6 @@ impl eframe::App for DotsApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         self.poll_connection();
         ctx.request_repaint_after(Duration::from_millis(100));
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .default_width(190.0)
-            .frame(egui::Frame::default().fill(PANEL))
-            .show(ctx, |ui| self.sidebar(ui));
         egui::TopBottomPanel::top("top")
             .exact_height(56.0)
             .frame(
@@ -544,26 +488,6 @@ impl eframe::App for DotsApp {
                     .inner_margin(egui::Margin::symmetric(18, 12)),
             )
             .show(ctx, |ui| self.top_bar(ui));
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(28.0)
-            .frame(
-                egui::Frame::default()
-                    .fill(PANEL)
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(&self.status).size(10.0).color(MUTED));
-                    if let Some(active) = &self.active {
-                        ui.separator();
-                        ui.label(
-                            RichText::new(format!("{}s", active.started.elapsed().as_secs()))
-                                .size(10.0)
-                                .color(MUTED),
-                        );
-                    }
-                });
-            });
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
