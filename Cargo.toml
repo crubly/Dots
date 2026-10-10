@@ -1,0 +1,23 @@
+[package]
+name = "dots"
+version = "0.1.0"
+edition = "2024"
+description = "A fast native SSH and SFTP workspace"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+directories = "6.0"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.33"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+strip = true
