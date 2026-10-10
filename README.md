@@ -9,7 +9,7 @@ Fast, native SSH and SFTP workspace written entirely in Rust. Dots uses an immed
 - command execution with a dedicated result pane
 - remote SFTP directory browsing
 - native release optimization (thin LTO, stripped binary)
-- GitHub Actions builds for Windows x64 and Apple Silicon macOS
+- GitHub Actions builds a Windows x64 binary and a macOS Apple Silicon `Dots.app` bundle
 
 ## Run locally
 
@@ -21,4 +21,4 @@ Create a server profile, point it at an existing private key, then connect. Prof
 
 ## CI artifacts
 
-Every push/PR builds downloadable binaries. Pushing a tag such as `v0.1.0` attaches both binaries to a GitHub Release.
+Every push/PR builds downloadable artifacts. Pushing a tag such as `v0.1.0` attaches the Windows binary and a double-clickable macOS `Dots.app` ZIP to a GitHub Release.

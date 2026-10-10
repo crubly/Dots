@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use std::{
     fs,
     io::{Read, Write},
@@ -24,7 +26,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 620.0])
-            .with_title("Dots"),
+            .with_title("Dots")
+            .with_decorations(false),
         ..Default::default()
     };
     eframe::run_native(
@@ -93,6 +96,23 @@ struct ActiveConnection {
     started: Instant,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum WorkspaceTab {
+    Home,
+    Sftp,
+    Terminal(u32),
+}
+
+impl WorkspaceTab {
+    fn label(self) -> String {
+        match self {
+            Self::Home => "Home".into(),
+            Self::Sftp => "SFTP".into(),
+            Self::Terminal(number) => format!("Terminal {number}"),
+        }
+    }
+}
+
 struct DotsApp {
     hosts: SavedHosts,
     selected: Option<u64>,
@@ -106,6 +126,9 @@ struct DotsApp {
     remote_upload: String,
     status: String,
     show_settings: bool,
+    tabs: Vec<WorkspaceTab>,
+    active_tab: usize,
+    next_terminal: u32,
 }
 
 impl DotsApp {
@@ -129,6 +152,9 @@ impl DotsApp {
             remote_upload: String::new(),
             status: "Ready".into(),
             show_settings: false,
+            tabs: vec![WorkspaceTab::Home, WorkspaceTab::Sftp],
+            active_tab: 0,
+            next_terminal: 1,
         }
     }
 
@@ -301,38 +327,89 @@ impl DotsApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let drag_region = ui.interact(
+            ui.max_rect(),
+            ui.id().with("window_drag_region"),
+            egui::Sense::drag(),
+        );
+        if drag_region.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new(if self.editing.name.is_empty() {
-                    "Untitled server"
-                } else {
-                    &self.editing.name
-                })
-                .strong()
-                .size(16.0),
+                RichText::new("DOTS")
+                    .strong()
+                    .size(15.0)
+                    .color(Color32::WHITE),
             );
-            ui.label(
-                RichText::new(format!("{}@{}", self.editing.user, self.editing.address))
-                    .color(MUTED),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if self.active.is_some() {
-                    if ui.button("Disconnect").clicked() {
-                        self.disconnect();
-                    }
-                } else if ui
+            ui.separator();
+            for (index, tab) in self.tabs.clone().into_iter().enumerate() {
+                let selected = self.active_tab == index;
+                if ui
                     .add(
-                        egui::Button::new(RichText::new("Connect").color(Color32::WHITE))
-                            .fill(ACCENT),
+                        egui::Button::new(tab.label())
+                            .selected(selected)
+                            .frame(false),
                     )
                     .clicked()
                 {
-                    self.connect();
+                    self.active_tab = index;
                 }
-                if ui.button("Server settings").clicked() {
+            }
+            if ui
+                .small_button("+")
+                .on_hover_text("New terminal tab")
+                .clicked()
+            {
+                self.tabs.push(WorkspaceTab::Terminal(self.next_terminal));
+                self.next_terminal += 1;
+                self.active_tab = self.tabs.len() - 1;
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("⚙").on_hover_text("Settings").clicked() {
                     self.show_settings = true;
                 }
+                ui.label(
+                    RichText::new(if self.active.is_some() { "●" } else { "○" }).color(
+                        if self.active.is_some() {
+                            Color32::from_rgb(105, 190, 118)
+                        } else {
+                            MUTED
+                        },
+                    ),
+                );
             });
+        });
+    }
+
+    fn home_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("HOME").size(10.0).color(MUTED));
+        ui.add_space(18.0);
+        ui.heading(if self.active.is_some() {
+            "Connected workspace"
+        } else {
+            "Connect a server"
+        });
+        ui.label(
+            RichText::new(format!("{}@{}", self.editing.user, self.editing.address)).color(MUTED),
+        );
+        ui.add_space(18.0);
+        if self.active.is_some() {
+            if ui.button("Disconnect").clicked() {
+                self.disconnect();
+            }
+        } else if ui
+            .add(egui::Button::new(RichText::new("Connect").color(Color32::WHITE)).fill(ACCENT))
+            .clicked()
+        {
+            self.connect();
+        }
+        ui.add_space(24.0);
+        ui.label(RichText::new("RECENT OUTPUT").size(10.0).color(MUTED));
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for line in self.terminal.iter().rev().take(8).rev() {
+                ui.label(RichText::new(line).family(egui::FontFamily::Monospace));
+            }
         });
     }
 
@@ -494,10 +571,16 @@ impl eframe::App for DotsApp {
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
-                ui.columns(2, |columns| {
-                    columns[0].vertical(|ui| self.terminal_panel(ui));
-                    columns[1].vertical(|ui| self.files_panel(ui));
-                });
+                match self
+                    .tabs
+                    .get(self.active_tab)
+                    .copied()
+                    .unwrap_or(WorkspaceTab::Home)
+                {
+                    WorkspaceTab::Home => self.home_panel(ui),
+                    WorkspaceTab::Sftp => self.files_panel(ui),
+                    WorkspaceTab::Terminal(_) => self.terminal_panel(ui),
+                }
             });
         if self.show_settings {
             self.settings_window(ctx);

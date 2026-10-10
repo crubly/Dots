@@ -25,7 +25,7 @@ jobs:
           - name: macOS Apple Silicon
             runner: macos-14
             target: aarch64-apple-darwin
-            artifact: dots-macos-aarch64
+            artifact: Dots-macos-aarch64.zip
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -33,9 +33,19 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
-      - name: Package artifact
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
         shell: bash
-        run: cp target/${{ matrix.target }}/release/dots${{ runner.os == 'Windows' && '.exe' || '' }} ${{ matrix.artifact }}
+        run: cp target/${{ matrix.target }}/release/dots.exe ${{ matrix.artifact }}
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p Dots.app/Contents/MacOS
+          cp packaging/macos/Info.plist Dots.app/Contents/Info.plist
+          cp target/${{ matrix.target }}/release/dots Dots.app/Contents/MacOS/Dots
+          chmod +x Dots.app/Contents/MacOS/Dots
+          ditto -c -k --sequesterRsrc --keepParent Dots.app ${{ matrix.artifact }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
