@@ -27,7 +27,8 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 620.0])
             .with_title("Dots")
-            .with_decorations(true),
+            .with_decorations(true)
+            .with_transparent(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -47,6 +48,36 @@ struct Host {
     key_path: String,
     #[serde(default)]
     folder: String,
+    #[serde(default)]
+    auth_mode: AuthMode,
+    #[serde(default)]
+    jump_host: JumpHost,
+    #[serde(skip)]
+    password: String,
+    #[serde(skip)]
+    key_passphrase: String,
+    #[serde(skip)]
+    pasted_key: String,
+    #[serde(default)]
+    trusted_fingerprints: Vec<String>,
+}
+
+#[derive(Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+enum AuthMode {
+    #[default]
+    Key,
+    Password,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct JumpHost {
+    enabled: bool,
+    protocol: String,
+    address: String,
+    port: u16,
+    user: String,
+    #[serde(skip)]
+    password: String,
 }
 
 impl Default for Host {
@@ -59,6 +90,16 @@ impl Default for Host {
             user: "root".into(),
             key_path: "~/.ssh/id_ed25519".into(),
             folder: "Personal".into(),
+            auth_mode: AuthMode::Key,
+            jump_host: JumpHost {
+                protocol: "SSH".into(),
+                port: 22,
+                ..Default::default()
+            },
+            password: String::new(),
+            key_passphrase: String::new(),
+            pasted_key: String::new(),
+            trusted_fingerprints: vec![],
         }
     }
 }
@@ -76,13 +117,38 @@ struct RemoteFile {
     size: u64,
 }
 
+#[derive(Clone)]
+struct LocalFile {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    size: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ClientSettings {
+    dark_theme: bool,
+    background_opacity: u8,
+}
+
+impl Default for ClientSettings {
+    fn default() -> Self {
+        Self {
+            dark_theme: true,
+            background_opacity: 255,
+        }
+    }
+}
+
 enum WorkerCommand {
+    TrustHost(bool),
     Run(String),
     List(PathBuf),
     Upload(PathBuf, PathBuf),
     Disconnect,
 }
 enum WorkerEvent {
+    HostFingerprint(String),
     Connected,
     Output(String),
     Files(Vec<RemoteFile>),
@@ -122,10 +188,17 @@ struct DotsApp {
     command: String,
     files: Vec<RemoteFile>,
     remote_path: PathBuf,
+    remote_path_text: String,
+    local_path: PathBuf,
+    local_path_text: String,
+    local_files: Vec<LocalFile>,
     local_upload: String,
     remote_upload: String,
     status: String,
     show_settings: bool,
+    show_client_settings: bool,
+    client_settings: ClientSettings,
+    pending_fingerprint: Option<String>,
     tabs: Vec<WorkspaceTab>,
     active_tab: usize,
     next_terminal: u32,
@@ -136,26 +209,37 @@ impl DotsApp {
         configure_theme(&cc.egui_ctx);
         let hosts = load_hosts().unwrap_or_default();
         let editing = hosts.hosts.first().cloned().unwrap_or_default();
-        Self {
+        let local_path = dirs_home().unwrap_or_else(|| PathBuf::from("."));
+        let client_settings = load_client_settings().unwrap_or_default();
+        let app = Self {
             hosts,
             selected: None,
             editing,
             active: None,
-            terminal: vec![
-                "Dots  •  Native SSH workspace".into(),
-                "Choose a server and press Connect.".into(),
-            ],
+            terminal: vec![],
             command: String::new(),
             files: vec![],
             remote_path: PathBuf::from("."),
+            remote_path_text: ".".into(),
+            local_files: list_local_files(&local_path),
+            local_path,
+            local_path_text: dirs_home()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .display()
+                .to_string(),
             local_upload: String::new(),
             remote_upload: String::new(),
             status: "Ready".into(),
             show_settings: false,
+            show_client_settings: false,
+            client_settings,
+            pending_fingerprint: None,
             tabs: vec![WorkspaceTab::Home, WorkspaceTab::Sftp],
             active_tab: 0,
             next_terminal: 1,
-        }
+        };
+        apply_client_theme(&cc.egui_ctx, &app.client_settings);
+        app
     }
 
     fn select_host(&mut self, id: u64) {
@@ -218,6 +302,9 @@ impl DotsApp {
         }
         for event in events {
             match event {
+                WorkerEvent::HostFingerprint(fingerprint) => {
+                    self.pending_fingerprint = Some(fingerprint)
+                }
                 WorkerEvent::Connected => {
                     self.status = "Connected".into();
                     self.terminal
@@ -263,6 +350,9 @@ impl DotsApp {
         if let Some(active) = &self.active {
             let _ = active.command_tx.send(WorkerCommand::Disconnect);
         }
+    }
+    fn refresh_local(&mut self) {
+        self.local_files = list_local_files(&self.local_path);
     }
     fn upload_file(&mut self) {
         let local = PathBuf::from(self.local_upload.trim());
@@ -310,8 +400,8 @@ impl DotsApp {
                 self.active_tab = self.tabs.len() - 1;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙").on_hover_text("Settings").clicked() {
-                    self.show_settings = true;
+                if ui.button("⚙").on_hover_text("Client settings").clicked() {
+                    self.show_client_settings = true;
                 }
                 ui.label(
                     RichText::new(if self.active.is_some() { "●" } else { "○" }).color(
@@ -395,54 +485,91 @@ impl DotsApp {
     }
 
     fn files_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("SFTP").size(10.0).color(MUTED));
-            if ui.small_button("↻").clicked() {
-                self.list_remote();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(self.remote_path.display().to_string()).color(MUTED));
-            if ui.small_button("Up").clicked() {
-                self.remote_path.pop();
-                self.list_remote();
-            }
-        });
-        ui.separator();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for file in self.files.clone() {
-                let icon = if file.is_dir { "▸" } else { "·" };
-                if ui
-                    .selectable_label(false, format!("{icon}  {}", file.name))
-                    .double_clicked()
-                    && file.is_dir
-                {
-                    self.remote_path = PathBuf::from(file.path);
-                    self.list_remote();
-                }
-                if !file.is_dir {
-                    ui.label(
-                        RichText::new(format!("    {} bytes", file.size))
-                            .size(10.0)
-                            .color(MUTED),
+        ui.columns(2, |columns| {
+            columns[0].vertical(|ui| {
+                ui.label(RichText::new("LOCAL").size(10.0).color(MUTED));
+                ui.horizontal(|ui| {
+                    let path_edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.local_path_text)
+                            .hint_text("Local path"),
                     );
+                    if path_edit.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                    {
+                        self.local_path = expand_home(&self.local_path_text);
+                        self.refresh_local();
+                    }
+                    if ui.small_button("↻").clicked() {
+                        self.refresh_local();
+                    }
+                });
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for file in self.local_files.clone() {
+                        let icon = if file.is_dir { "▸" } else { "·" };
+                        if ui
+                            .selectable_label(false, format!("{icon}  {}", file.name))
+                            .double_clicked()
+                            && file.is_dir
+                        {
+                            self.local_path = file.path;
+                            self.local_path_text = self.local_path.display().to_string();
+                            self.refresh_local();
+                        }
+                    }
+                });
+            });
+            columns[1].vertical(|ui| {
+                ui.label(RichText::new("REMOTE").size(10.0).color(MUTED));
+                if self.active.is_none() {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for host in self.hosts.hosts.clone() {
+                            if ui
+                                .selectable_label(false, format!("●  {}", host.name))
+                                .double_clicked()
+                            {
+                                self.select_host(host.id);
+                                self.connect();
+                            }
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let remote_edit = ui.add(
+                            egui::TextEdit::singleline(&mut self.remote_path_text)
+                                .hint_text("Remote path"),
+                        );
+                        if remote_edit.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            self.remote_path = PathBuf::from(&self.remote_path_text);
+                            self.list_remote();
+                        }
+                        if ui.small_button("Up").clicked() {
+                            self.remote_path.pop();
+                            self.remote_path_text = self.remote_path.display().to_string();
+                            self.list_remote();
+                        }
+                        if ui.small_button("↻").clicked() {
+                            self.list_remote();
+                        }
+                    });
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for file in self.files.clone() {
+                            let icon = if file.is_dir { "▸" } else { "·" };
+                            if ui
+                                .selectable_label(false, format!("{icon}  {}", file.name))
+                                .double_clicked()
+                                && file.is_dir
+                            {
+                                self.remote_path = PathBuf::from(file.path);
+                                self.remote_path_text = self.remote_path.display().to_string();
+                                self.list_remote();
+                            }
+                        }
+                    });
                 }
-            }
-            if self.files.is_empty() {
-                ui.add_space(20.0);
-                ui.label(RichText::new("Connect to browse remote files.").color(MUTED));
-            }
+            });
         });
-        ui.separator();
-        ui.label(RichText::new("UPLOAD VIA SFTP").size(10.0).color(MUTED));
-        ui.add(egui::TextEdit::singleline(&mut self.local_upload).hint_text("Local file path"));
-        ui.add(
-            egui::TextEdit::singleline(&mut self.remote_upload)
-                .hint_text("Remote destination path"),
-        );
-        if ui.button("Upload file").clicked() {
-            self.upload_file();
-        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context) {
@@ -459,20 +586,102 @@ impl DotsApp {
                     ui.add(egui::DragValue::new(&mut self.editing.port).range(1..=65535));
                 });
                 field(ui, "User", &mut self.editing.user);
-                field(ui, "Private key", &mut self.editing.key_path);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Authentication");
+                    ui.radio_value(&mut self.editing.auth_mode, AuthMode::Key, "Key");
+                    ui.radio_value(&mut self.editing.auth_mode, AuthMode::Password, "Password");
+                });
+                match self.editing.auth_mode {
+                    AuthMode::Password => {
+                        ui.add(egui::TextEdit::singleline(&mut self.editing.password).password(true).hint_text("Password — not saved"));
+                    }
+                    AuthMode::Key => {
+                        field(ui, "Key file", &mut self.editing.key_path);
+                        ui.add(egui::TextEdit::singleline(&mut self.editing.key_passphrase).password(true).hint_text("Key passphrase — not saved"));
+                        ui.add(egui::TextEdit::multiline(&mut self.editing.pasted_key).hint_text("Or paste a private key here (not saved)").desired_rows(3));
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut self.editing.jump_host.enabled, "Jump host / proxy");
+                if self.editing.jump_host.enabled {
+                    field(ui, "Protocol", &mut self.editing.jump_host.protocol);
+                    field(ui, "Proxy host", &mut self.editing.jump_host.address);
+                    ui.horizontal(|ui| {
+                        ui.label("Proxy port");
+                        ui.add(egui::DragValue::new(&mut self.editing.jump_host.port).range(1..=65535));
+                    });
+                    field(ui, "Proxy user", &mut self.editing.jump_host.user);
+                    ui.add(egui::TextEdit::singleline(&mut self.editing.jump_host.password).password(true).hint_text("Proxy password — not saved"));
+                }
                 ui.add_space(10.0);
                 if ui.button("Save server").clicked() {
                     self.save_edit();
                 }
                 ui.label(
                     RichText::new(
-                        "Credentials and keys stay on your machine; Dots stores only the key path.",
+                        "Passwords, passphrases, and pasted keys remain only in memory and are never written to the profile.",
                     )
                     .size(10.0)
                     .color(MUTED),
                 );
             });
         self.show_settings = open;
+    }
+
+    fn client_settings_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_client_settings;
+        egui::Window::new("Client settings")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(360.0);
+                ui.checkbox(&mut self.client_settings.dark_theme, "Dark theme");
+                ui.add(
+                    egui::Slider::new(&mut self.client_settings.background_opacity, 150..=255)
+                        .text("Background opacity"),
+                );
+                if ui.button("Save settings").clicked() {
+                    let _ = save_client_settings(&self.client_settings);
+                    apply_client_theme(ctx, &self.client_settings);
+                }
+            });
+        self.show_client_settings = open;
+    }
+
+    fn fingerprint_window(&mut self, ctx: &egui::Context) {
+        let Some(fingerprint) = self.pending_fingerprint.clone() else {
+            return;
+        };
+        egui::Window::new("Verify server fingerprint")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
+            .show(ctx, |ui| {
+                ui.label("Verify this SHA-256 fingerprint with the server owner:");
+                ui.monospace(&fingerprint);
+                ui.horizontal(|ui| {
+                    if ui.button("Reject").clicked() {
+                        if let Some(active) = &self.active {
+                            let _ = active.command_tx.send(WorkerCommand::TrustHost(false));
+                        }
+                        self.pending_fingerprint = None;
+                    }
+                    if ui
+                        .add(egui::Button::new("Trust and connect").fill(ACCENT))
+                        .clicked()
+                    {
+                        if let Some(active) = &self.active {
+                            let _ = active.command_tx.send(WorkerCommand::TrustHost(true));
+                        }
+                        if !self.editing.trusted_fingerprints.contains(&fingerprint) {
+                            self.editing.trusted_fingerprints.push(fingerprint);
+                            self.save_edit();
+                        }
+                        self.pending_fingerprint = None;
+                    }
+                });
+            });
     }
 }
 
@@ -491,7 +700,12 @@ impl eframe::App for DotsApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::default()
-                    .fill(BG)
+                    .fill(Color32::from_rgba_unmultiplied(
+                        22,
+                        25,
+                        30,
+                        self.client_settings.background_opacity,
+                    ))
                     .inner_margin(egui::Margin::same(16)),
             )
             .show(ctx, |ui| {
@@ -509,6 +723,10 @@ impl eframe::App for DotsApp {
         if self.show_settings {
             self.settings_window(ctx);
         }
+        if self.show_client_settings {
+            self.client_settings_window(ctx);
+        }
+        self.fingerprint_window(ctx);
     }
 }
 
@@ -529,13 +747,58 @@ fn worker_inner(
     let mut session = Session::new().context("Could not create SSH session")?;
     session.set_tcp_stream(tcp);
     session.handshake().context("SSH handshake failed")?;
-    let key = expand_home(&host.key_path);
-    if key.exists() {
-        session
-            .userauth_pubkey_file(&host.user, None, &key, None)
-            .context("SSH key authentication failed")?;
-    } else {
-        return Err(anyhow::anyhow!("Private key not found: {}", key.display()));
+    let fingerprint = session
+        .host_key_hash(ssh2::HashType::Sha256)
+        .map(|bytes| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        })
+        .unwrap_or_else(|| "Server did not provide a SHA-256 host fingerprint".into());
+    if !host.trusted_fingerprints.contains(&fingerprint) {
+        let _ = events.send(WorkerEvent::HostFingerprint(fingerprint));
+        match commands
+            .recv()
+            .context("Connection approval was cancelled")?
+        {
+            WorkerCommand::TrustHost(true) => {}
+            WorkerCommand::TrustHost(false) | WorkerCommand::Disconnect => {
+                return Err(anyhow::anyhow!("Host fingerprint rejected"));
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Host fingerprint must be approved before connecting"
+                ));
+            }
+        }
+    }
+    match host.auth_mode {
+        AuthMode::Password => session
+            .userauth_password(&host.user, &host.password)
+            .context("Password authentication failed")?,
+        AuthMode::Key if !host.pasted_key.trim().is_empty() => session
+            .userauth_pubkey_memory(
+                &host.user,
+                None,
+                &host.pasted_key,
+                (!host.key_passphrase.is_empty()).then_some(host.key_passphrase.as_str()),
+            )
+            .context("Pasted private key authentication failed")?,
+        AuthMode::Key => {
+            let key = expand_home(&host.key_path);
+            if !key.exists() {
+                return Err(anyhow::anyhow!("Private key not found: {}", key.display()));
+            }
+            session
+                .userauth_pubkey_file(
+                    &host.user,
+                    None,
+                    &key,
+                    (!host.key_passphrase.is_empty()).then_some(host.key_passphrase.as_str()),
+                )
+                .context("SSH key authentication failed")?;
+        }
     }
     if !session.authenticated() {
         return Err(anyhow::anyhow!("Authentication was rejected"));
@@ -543,6 +806,7 @@ fn worker_inner(
     let _ = events.send(WorkerEvent::Connected);
     while let Ok(command) = commands.recv() {
         match command {
+            WorkerCommand::TrustHost(_) => {}
             WorkerCommand::Run(command) => run_command(&session, &command, &events)?,
             WorkerCommand::List(path) => list_files(&session, &path, &events)?,
             WorkerCommand::Upload(local, remote) => upload(&session, &local, &remote, &events)?,
@@ -615,6 +879,18 @@ fn configure_theme(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     ctx.set_style(style);
 }
+fn apply_client_theme(ctx: &egui::Context, settings: &ClientSettings) {
+    let mut style = (*ctx.style()).clone();
+    style.visuals = if settings.dark_theme {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    style.visuals.panel_fill =
+        Color32::from_rgba_unmultiplied(28, 32, 39, settings.background_opacity);
+    style.visuals.window_fill = style.visuals.panel_fill;
+    ctx.set_style(style);
+}
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String) {
     ui.horizontal(|ui| {
         ui.label(label);
@@ -626,6 +902,25 @@ fn next_id(hosts: &SavedHosts) -> u64 {
 }
 fn config_path() -> Option<PathBuf> {
     ProjectDirs::from("dev", "dots", "Dots").map(|dirs| dirs.config_dir().join("hosts.json"))
+}
+fn client_settings_path() -> Option<PathBuf> {
+    ProjectDirs::from("dev", "dots", "Dots").map(|dirs| dirs.config_dir().join("settings.json"))
+}
+fn load_client_settings() -> Result<ClientSettings> {
+    let Some(path) = client_settings_path() else {
+        return Ok(ClientSettings::default());
+    };
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+fn save_client_settings(settings: &ClientSettings) -> Result<()> {
+    let Some(path) = client_settings_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serde_json::to_vec_pretty(settings)?)?;
+    Ok(())
 }
 fn load_hosts() -> Result<SavedHosts> {
     let Some(path) = config_path() else {
@@ -653,4 +948,23 @@ fn expand_home(value: &str) -> PathBuf {
 }
 fn dirs_home() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf())
+}
+fn list_local_files(path: &Path) -> Vec<LocalFile> {
+    let mut files = fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            Some(LocalFile {
+                name: entry.file_name().to_string_lossy().to_string(),
+                path: entry.path(),
+                is_dir: metadata.is_dir(),
+                size: metadata.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|file| (!file.is_dir, file.name.to_lowercase()));
+    files
 }
